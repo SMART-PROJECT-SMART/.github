@@ -2,357 +2,434 @@
 
 ## Overview
 
-SMART is a comprehensive simulation and command-support stack for advanced reconnaissance and tactical operations. It combines **real-time UAV simulation**, **live and historical telemetry**, **mission and assignment planning**, **device and sleeve coordination**, **map-backed situational displays**, and **MongoDB-backed records** behind an **Angular** operator client. Services communicate over **HTTP APIs**, **Kafka**, and **MongoDB**, with **Nginx** as a gateway and **Docker Compose** for local infrastructure.
+SMART is a **simulation and command-support** platform for advanced reconnaissance and tactical operations. At runtime it combines:
 
-Operational details (ports, credentials, and startup variants) are maintained in **`scripts/README.md`** alongside compose helpers under `scripts/` and compose definitions under `docker/`.
+- **UAV simulation** (multi-aircraft physics, missions, Quartz scheduling, ICD-aligned telemetry semantics).
+- **Live telemetry ingestion** (capture, decode, validate, multi-port device management).
+- **Mission and assignment services** (suggestions, execution, results, genetic and other assignment algorithms, scenario testing).
+- **Fleet and sleeve coordination** (DeviceManager as the persistence and notification hub; ACM for assignment-side orchestration and Kafka-driven status).
+- **Durable telemetry and records** (TelemetryRecords on MongoDB; MongoConsumer bridging Kafka notifications into handlers and storage).
+- **Live telemetry fan-out** (LTS exposing Kafka-backed UAV snapshots and per-session “wanted fields” for the UI).
+- **Geospatial context** (MapServer tiles served through the Nginx gateway).
+- **Operator UI** (Angular SPA: assignment review on maps, live view, device management, archive and mission telemetry investigation).
 
-## System Architecture
+Services integrate through **HTTP** (REST, including **DeviceManager-originated webhooks**), **Apache Kafka**, and **MongoDB**. Local infrastructure is defined under **`docker/`**; convenience scripts live under **`scripts/`**.
+
+**Ports, default URLs, credential defaults, and scripted startup variants** are documented in **`scripts/README.md`** (that file is the source of truth for numbers that change per environment).
+
+---
+
+## System architecture (diagram)
 
 <img width="11558" height="7194" alt="FULL" src="https://github.com/user-attachments/assets/3b2a76ac-3e72-4eb6-9b1b-a35954d7ee66" />
 
-_System Architecture Design - Visual representation of the SMART system components and their interactions_
+*Visual architecture of SMART components and interactions.*
 
-## Architecture
+---
 
-The system is organized as **multiple ASP.NET Core services** plus an **Angular** front end, supported by **containerized infrastructure** (MongoDB, Kafka, Nginx). Typical local flows start **Docker** first, then **.NET** services (often with **DeviceManager** early because other components depend on it), then the **client** dev server.
+## Logical architecture and dependencies
 
-## Core backend services
+At a high level:
 
-| Component            | Role                                                                                                                                                                                                      |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Simulation**       | Main simulation engine: UAV flight physics, flight paths, motion and orientation, Quartz-driven jobs, multi-UAV scenarios, REST control, **ICD-aligned** telemetry semantics. See `Simulation/README.md`. |
-| **TelemetryDevice**  | Live telemetry path: packet capture, validation, ICD decoding, pipeline-based processing, dynamic ports and multi-device handling. See `TelemetryDevice/README.md`.                                       |
-| **DeviceManager**    | Central coordination: **MongoDB** persistence, **Kafka**, and notification-style integration toward Simulation, TelemetryDevice, ACM, and MongoConsumer so the fleet state stays coherent.                |
-| **ACM**              | Airborne / assignment-side coordination: **sleeve** workflows, **DeviceManager** and **Simulator** HTTP clients, **Kafka**, assignment services, and **UAV status consumption**.                          |
-| **Mission Service**  | Mission domain: **assignments** (including algorithm hooks), **assignment results**, **mission status**, **mission execution**, UAV services, **MongoDB**, and background processing.                     |
-| **LTS**              | Live telemetry support APIs: **UAV telemetry data** and **wanted-fields** configuration used by downstream consumers.                                                                                     |
-| **TelemetryRecords** | Durable telemetry and mission-side records over **MongoDB**: telemetry data APIs and assignment-related endpoints.                                                                                        |
-| **MongoCon sumer**   | Stream and integration worker: **Kafka**, **HTTP clients**, **MongoDB**, and **UAV change handlers** to propagate updates into persistence and other workflows.                                           |
-| **MapServer**        | Map tile and map services used by the gateway and UI; tiles are mounted into **Nginx** for static map delivery.                                                                                           |
+1. **Infrastructure** (Docker): MongoDB, Kafka, Nginx gateway (and optional compose projects you enable locally).
+2. **DeviceManager** is started **before** most other .NET services in `scripts/run-all.bat` (10 second wait) because it owns **UAV and sleeve** documents and **notifies** Simulation, TelemetryDevice, ACM, and MongoConsumer when fleet topology changes.
+3. **Simulation** and **TelemetryDevice** run the **live loop** (UAV motion, sniffers, pipelines) and accept **webhooks** from DeviceManager.
+4. **ACM** consumes **Kafka**, calls **DeviceManager** and **Simulation**, and receives **sleeve** webhooks from DeviceManager paths as configured.
+5. **Mission Service** drives **assignment suggestions**, **apply-assignment** execution, **mission status**, and hosts an extensive **`api/Test`** scenario suite for algorithms.
+6. **LTS** exposes **peek** style access to consolidated UAV telemetry derived from Kafka consumption.
+7. **TelemetryRecords** serves **paginated mission telemetry pages** and **assignment history** to the client.
+8. **MongoConsumer** reacts to **UAV changed** webhooks and Kafka to keep persistence aligned.
+9. **Angular client** calls Mission, TelemetryRecords, LTS, Simulation, and other APIs depending on the page (see client routes below).
+
+```mermaid
+flowchart TB
+  subgraph infra [Docker]
+    M[(MongoDB)]
+    K[[Kafka]]
+    N[Nginx / tiles]
+  end
+  subgraph dotnet [ASP.NET Core services]
+    DM[DeviceManager]
+    SIM[Simulation]
+    TD[TelemetryDevice]
+    ACM[ACM]
+    MS[Mission Service]
+    LTS[LTS]
+    TR[TelemetryRecords]
+    MC[MongoConsumer]
+    MAP[MapServer]
+  end
+  UI[Angular client]
+  DM --> M
+  DM --> K
+  DM -.->|webhooks| SIM
+  DM -.->|webhooks| TD
+  DM -.->|webhooks| MC
+  ACM --> K
+  ACM --> DM
+  ACM --> SIM
+  MS --> M
+  TR --> M
+  MC --> M
+  MC --> K
+  LTS --> K
+  UI --> MS
+  UI --> TR
+  UI --> LTS
+  UI --> SIM
+  N --> MAP
+```
+
+---
+
+## Core backend services (detailed)
+
+### Simulation (`Simulation/Simulation`)
+
+- **Role:** Primary **UAV flight simulation**: spawn and run UAVs, flight paths, motion and orientation, speed control, pause/resume/abort, multi-UAV runs, integration with **ICD** definitions from **Core**.
+- **Scheduling:** **Quartz.NET** for recurring work (telemetry emission, simulation ticks, housekeeping as implemented per job registration).
+- **Notable patterns:** `UAVManager`, flight path services, channel models, **DeviceManager webhooks** so fleet changes from DeviceManager update in-memory or stored UAV state.
+- **Documentation:** `Simulation/README.md` (UAV catalog: Searcher, Hermes 450, Hermes 900, Heron TP, and related armed/surveillance bases).
+
+### TelemetryDevice (`TelemetryDevice/TelemetryDevice`)
+
+- **Role:** **Live telemetry pipeline**: SharpPcap-based sniffing, handler factory, **validation → decode → output** stages (Dataflow blocks where used), **dynamic add/remove** of telemetry devices and sniff ports.
+- **Integration:** **DeviceManagerWebhook** for `sleeve-changed` so port and sleeve topology stays aligned with DeviceManager.
+- **Documentation:** `TelemetryDevice/README.md` (pipeline and pattern detail).
+
+### DeviceManager (`DeviceManager/DeviceManager`)
+
+- **Role:** **Fleet authority** for **UAVs** and **Sleeves**: CRUD REST APIs backed by **MongoDB**, **Kafka** producers/consumers as registered in DI, and **notification** paths to Simulation, TelemetryDevice, ACM, and MongoConsumer when UAVs or ports change.
+- **Why it is first in `run-all.bat`:** Other services rely on consistent **UAV tail IDs**, **sleeve assignment**, and **port sets** before they bind listeners or run scenarios.
+
+### ACM (`ACM/ACM`)
+
+- **Role:** **Assignment and sleeve-side coordination**: sleeve-related services, **HTTP clients** to DeviceManager and Simulation, **Kafka** services, **assignment** services, and **UAV status consumption** (registration names from `Program.cs`).
+- **Webhooks:** Exposes **`POST api/DeviceManagerWebhook/sleeve-changed`** for DeviceManager-driven updates.
+
+### Mission Service (`Mission Service/Mission Service`)
+
+- **Role:** **Mission and assignment** domain: queue assignment suggestions, track **assignment execution** and **results**, **mission status** (active missions per tail), **mission completion** callbacks, **MongoDB** integration, background processing, and **HTTP clients** to other services as configured.
+- **Algorithms:** Genetic assignment and related services (see `Services/` tree); **`api/Test`** exposes many **deterministic scenario** and **stress** endpoints for regression and demos.
+- **Typical client flow:** `POST .../create-assignment-suggestion` → poll **`api/AssignmentResult/{id}/status`** → fetch **`api/AssignmentResult/{id}`** → optionally `POST .../apply-assignment`.
+
+### LTS (`LTS/LTS`)
+
+- **Role:** **Live telemetry support** for the UI: **Kafka snapshot consumer** to expose current UAV telemetry (`GET api/UAVTelemetryData/all-uav-telemetry-data`), and **session-scoped wanted fields** via **`PUT api/wanted-fields/{sessionId}`** so clients declare which telemetry columns they need.
+
+### TelemetryRecords (`TelemetryRecords/TelemetryRecords`)
+
+- **Role:** **Historical and mission-scoped telemetry** and **assignment records** on MongoDB: mission telemetry pages (with optional time bounds, paging, field filters), telemetry bounds queries, and assignment queries (`latest`, by date, by mission).
+
+### MongoConsumer (`MongoConsumer/MongoConsumer`)
+
+- **Role:** **Integration worker**: Kafka consumption, **HTTP clients**, MongoDB, **hosted services**, and **UAV change handlers** selected from a factory when DeviceManager reports changes.
+- **Webhooks:** **`POST api/DeviceManagerWebhook/uav-changed`** (and related DTO handling as implemented).
+
+### MapServer (`MapServer/MapServer`)
+
+- **Role:** **Map stack** for situational displays: map services, **tile generation or storage** under `MapServer/MapServer/tiles` (mounted into the gateway container). **`HealthController`** for readiness checks.
+- **Note:** **`scripts/run-all.bat` does not start MapServer**; use `scripts/README.md` manual service list or your own orchestration if you need MapServer every time.
+
+---
+
+## DeviceManager webhooks (cross-service HTTP)
+
+DeviceManager (or callers acting on its behalf) triggers downstream updates through dedicated webhook controllers:
+
+| Target service | Controller route prefix | Example actions |
+|----------------|---------------------------|-----------------|
+| Simulation | `api/DeviceManagerWebhook` | `uav-changed`, `uav-ports-changed`, `uavs-ports-changed-batch` |
+| TelemetryDevice | `api/DeviceManagerWebhook` | `sleeve-changed` |
+| MongoConsumer | `api/DeviceManagerWebhook` | `uav-changed` |
+| ACM | `api/DeviceManagerWebhook` | `sleeve-changed` |
+
+Exact payloads are the DTOs under each project’s `Models` or `DTOs` folders.
+
+---
+
+## HTTP API reference (representative)
+
+Base paths assume default Kestrel URL and `api/` prefix from each service’s launch profile. Prefer **Swagger** (`/swagger`) when enabled.
+
+### Simulation — `api/Simulation`, `api/Communication`, `api/UAVStatus`, `api/DeviceManagerWebhook`
+
+| Method | Route (relative to controller) | Purpose |
+|--------|--------------------------------|---------|
+| POST | `api/Simulation/simulate` | Run simulation entry points |
+| POST | `api/Simulation/switch` | Destination / scenario switching |
+| POST | `api/Simulation/pause/{tailId}` | Pause a UAV |
+| POST | `api/Simulation/resume/{tailId}` | Resume |
+| POST | `api/Simulation/abort/{tailId}` | Abort one |
+| POST | `api/Simulation/abort-all` | Abort all |
+| GET | `api/Simulation/status` | Status |
+| GET | `api/Simulation/all-uav` | List UAVs |
+| GET | `api/Simulation/run`, `run-multi`, `run-20`, `show` | Demo and multi-UAV runs |
+| POST | `api/Communication/switch-ports` | Channel / port switching |
+| GET | `api/UAVStatus/all-uav`, `active-uav` | UAV status views |
+
+### TelemetryDevice — `api/TelemetryDevice`, `api/Sniffers`, `api/DeviceManagerWebhook`
+
+| Method | Route | Purpose |
+|--------|--------|---------|
+| POST | `api/TelemetryDevice/add-telemetry-device` | Register a device |
+| POST | `api/TelemetryDevice/remove-telemetry-device` | Remove |
+| GET | `api/TelemetryDevice/run` | Start processing |
+| POST | `api/TelemetryDevice/switch-port` | Port switch |
+| POST | `api/Sniffers/add-port` | Add sniffer port |
+| POST | `api/Sniffers/remove-port` | Remove port |
+| GET | `api/Sniffers/run` | Run sniffers |
+
+### DeviceManager — `api/UAV`, `api/Sleeve`
+
+| Method | Route | Purpose |
+|--------|--------|---------|
+| GET/POST/PUT/DELETE | `api/UAV`, `api/UAV/{tailId}` | UAV CRUD |
+| GET/POST/PUT/DELETE | `api/Sleeve`, `api/Sleeve/{name}` | Sleeve CRUD |
+| GET | `api/Sleeve/available-for-uav/{tailId}` | Query availability |
+| POST | `api/Sleeve/release/{tailId}` | Release |
+| POST | `api/Sleeve/assign` | Assign sleeve to UAV |
+
+### Mission Service
+
+| Area | Route | Purpose |
+|------|--------|---------|
+| Assignments | `POST api/Assignment/create-assignment-suggestion` | Queue suggestion; returns assignment id and status URL |
+| Assignments | `POST api/Assignment/apply-assignment` | Execute chosen assignment |
+| Results | `GET api/AssignmentResult/{assignmentId}` | Fetch and consume result |
+| Results | `GET api/AssignmentResult/{assignmentId}/status` | Poll execution status |
+| Mission status | `GET api/mission-status/active-missions` | All active missions |
+| Mission status | `GET api/mission-status/active-mission/{tailId}` | Per-tail active mission |
+| Mission status | `POST api/mission-status/mission-completed/{tailId}` | Clear active mission |
+| Test / scenarios | `GET api/Test/scenarios`, `POST api/Test/scenarios/missions` | Scenario registry |
+| Test / algorithms | `GET api/Test/test/*` | Many named tests (equal assignment, resource constraints, overlap, priority, telemetry optimization, stress, edge cases, etc.) |
+
+### LTS
+
+| Method | Route | Purpose |
+|--------|--------|---------|
+| GET | `api/UAVTelemetryData/all-uav-telemetry-data` | Current snapshots (Kafka-backed) |
+| PUT | `api/wanted-fields/{sessionId}` | Update wanted field set for a session |
+
+### TelemetryRecords
+
+| Method | Route | Purpose |
+|--------|--------|---------|
+| GET | `api/TelemetryData/by-mission` | Mission telemetry page (query: missionId, tailId, optional fields, time range, paging) |
+| GET | `api/TelemetryData/bounds` | Time bounds for telemetry |
+| GET | `api/AssignmentRecords/latest` | Latest stored assignment |
+| GET | `api/AssignmentRecords/by-date/{date}` | By date |
+| GET | `api/AssignmentRecords/by-mission/{missionId}` | By mission |
+
+### MapServer
+
+| Method | Route | Purpose |
+|--------|--------|---------|
+| GET | `api/Health` | Health check |
+
+### Gateway static tiles
+
+- Nginx serves **`/tiles/`** from the container root per `docker/nginx/nginx.conf` (tiles on disk come from the MapServer mount in `docker-compose.gateway.yml`).
+
+---
 
 ## Angular client (`client/`)
 
-The **Angular** application is the primary operator interface. Major areas include:
+- **Stack:** Angular (see `client/README.md` for CLI version), `ng serve` default **`http://localhost:4200`**.
 
-- **Assignment** — mission and scenario selection, assignment m
-  anagement, **map-centric review** (UAV and mission markers, filters, tooltips, algorithm panels), summaries, and related dialogs.
-- **Archive** — historical mission telemetry views, time-range selection, and comparison/diff style tooling where implemented.
-- **Routing and modules** — standard SPA navigation across these domains with service calls into the APIs above.
+### Application routes (`app-routing.module.ts`)
 
-Use `client/README.md` for CLI versions, `ng serve`, builds, and tests.
+| Path | Component (purpose) |
+|------|---------------------|
+| `''` | Redirects to assignment page |
+| `assignment-page` | Assignment workspace: scenarios, mission editing, **map-based assignment review** (markers, filters, tooltips, algorithm panels, summaries, dialogs) |
+| `live-view-page` | Live situational view |
+| `device-management-page` | Device and fleet management UI |
+| `archive` | Archive landing |
+| `archive/investigate` | **Mission telemetry** deep dive (charts, time range, related archive components) |
+
+### Typical client dependencies
+
+- **Mission Service** for assignments, scenarios, and tests where the UI invokes them.
+- **TelemetryRecords** for mission telemetry pages and assignment history.
+- **LTS** for live telemetry snapshots and wanted-fields updates.
+- **Simulation / DeviceManager** as configured in environment files and Angular services under `client/src/app/`.
+
+---
 
 ## Data platform and infrastructure
 
-| Layer                                                                              | Purpose                                                                                                                |
-| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **MongoDB** (`docker/docker-compose.mongodb.yml`)                                  | Primary document store for missions, telemetry records, device/manager state, and related services.                    |
-| **Kafka** (`docker/docker-compose.messaging.yml`)                                  | Inter-service events and streaming; consumed by MongoConsumer, ACM, DeviceManager integrations, and related producers. |
-| **Nginx gateway** (`docker/docker-compose.gateway.yml`, `docker/nginx/nginx.conf`) | HTTP entry, routing, and **map tile** hosting from MapServer content.                                                  |
-| **Core** (`Core/`)                                                                 | Shared **ICD** JSON and shared libraries referenced by simulation and telemetry stacks.                                |
-| **Shared** (`Shared/`)                                                             | Additional shared assets or libraries as used by solutions in this repository.                                         |
+| Layer | Files | Role |
+|-------|--------|------|
+| MongoDB | `docker/docker-compose.mongodb.yml` | Document database for DeviceManager, Mission Service, TelemetryRecords, MongoConsumer, and related persistence. |
+| Kafka | `docker/docker-compose.messaging.yml` | Broker for ACM, LTS snapshots, DeviceManager, MongoConsumer, and other registered producers/consumers. |
+| Nginx | `docker/docker-compose.gateway.yml`, `docker/nginx/nginx.conf` | HTTP on host port **80** → container **8080**; static **`/tiles/`** with cache headers. |
+| Core | `Core/Core/Files/ICD/*.json` | **ICD** telemetry definitions (e.g. `NorthICD_telemetry.json`, `SouthICD_telemetry.json`) referenced from Simulation configuration. |
+| Shared | `Shared/` | Additional shared libraries referenced by solutions in this repository. |
 
-## Key features (system-wide)
+---
 
-**Simulation and UAV modeling**
+## Key features (system-wide, expanded)
 
-- Armed and surveillance **UAV types** with distinct mass, speed, altitude, sensors, and weapons where modeled (see Simulation README for platform list).
-- **Flight path** services: motion, orientation, speed control, and validation.
-- **Quartz.NET** scheduling for periodic telemetry, simulation ticks, and maintenance-style jobs.
-- **ICD**-driven payloads for North/South-style configurations (files under `Core/Core/Files/ICD/`).
+**Simulation**
 
-**Telemetry and sensing**
+- Multiple **armed** and **surveillance** UAV archetypes with distinct performance and payload modeling.
+- **Flight path** pipeline: motion, orientation, speed, validation; **multi-UAV** run endpoints.
+- **ICD**-driven telemetry fields aligned with **Core** JSON.
+- **Quartz**-based periodic jobs (telemetry generation, simulation stepping, maintenance tasks).
 
-- **Live capture** and decode pipelines (checksums, ICD decoders, outputs).
-- **Multi-port** and **port manager** behavior for channel switching.
-- **TelemetryRecords** and **LTS** for serving and shaping telemetry for UI and analytics.
+**Telemetry**
 
-**Missions, assignments, and C2-style workflows**
+- **Live pipeline** with validation, ICD decode, and pluggable outputs.
+- **Dynamic ports** and **multi-device** lifecycle.
+- **TelemetryRecords** for **mission-scoped** history and **paging**.
+- **LTS** for **operator-selected field sets** and **live snapshot** readout.
 
-- **Mission Service** APIs for assignments, results, and mission status plus execution pipeline.
-- **ACM** integration with assignments, Kafka, and live UAV status.
-- **Client** workflows for assignment review on maps, scenario handling, and mission summaries.
+**Missions and assignments**
 
-**Integration and operations**
+- **Suggestion queue**, **async execution**, **result retrieval**, and **apply** path for committed assignments.
+- **Mission status** per tail and global active mission list.
+- **Large automated test surface** under `api/Test` for algorithm and scenario validation.
 
-- **DeviceManager** as the hub for cross-service notifications and persistence alignment.
-- **MongoConsumer** for Kafka-driven persistence and UAV change handling.
-- **MapServer** plus gateway for **map-backed** situational awareness.
-- **Scripted** Docker and multi-service startup documented under `scripts/README.md`.
+**Operations and integration**
+
+- **DeviceManager** as **authoritative** UAV/sleeve store with **outbound notifications**.
+- **MongoConsumer** for **event-driven** persistence updates.
+- **MapServer + Nginx** for **map-backed** assignment and live views.
+- **Scripts** for compose-all, per-stack compose, and multi-window **`run-all.bat`** (see limitations above for MapServer).
+
+---
 
 ## Project structure
 
 ```
-├── client/                     # Angular SPA (assignment, archive, mission telemetry UI)
-├── Simulation/                 # UAV flight simulation service
-├── TelemetryDevice/            # Live telemetry capture and pipeline
-├── DeviceManager/              # Coordination hub (MongoDB, Kafka, notifications)
-├── ACM/                        # Assignment / sleeve coordination, Kafka, clients
-├── Mission Service/            # Missions, assignments, execution, MongoDB
-├── LTS/                        # Live telemetry and wanted-fields APIs
-├── TelemetryRecords/         # MongoDB-backed telemetry and assignment records
-├── MongoConsumer/            # Kafka consumers, MongoDB, UAV change handlers
-├── MapServer/                  # Map services and tiles for the gateway
-├── Core/                       # ICD definitions and shared code
-├── Shared/                     # Additional shared libraries or assets
-├── docker/                     # docker-compose.*.yml (MongoDB, Kafka, gateway)
-├── scripts/                    # compose-*.bat, run-all.bat, UML helpers, utilities
-└── UML/                        # Generated or maintained UML material
+├── client/                      # Angular SPA
+├── Simulation/Simulation/       # Simulation API host project
+├── TelemetryDevice/TelemetryDevice/
+├── DeviceManager/DeviceManager/
+├── ACM/ACM/
+├── Mission Service/Mission Service/
+├── LTS/LTS/
+├── TelemetryRecords/TelemetryRecords/
+├── MongoConsumer/MongoConsumer/
+├── MapServer/MapServer/
+├── Core/                        # ICD + shared models/services
+├── Shared/
+├── docker/                      # Compose stacks + nginx config
+├── scripts/                     # compose-*.bat, run-all.bat, UML, utilities
+└── UML/
 ```
 
-## Getting Started
+---
+
+## Getting started
 
 ### Prerequisites
 
-- .NET 9.0 or later (match the SDK used by your solution files)
-- Docker and Docker Compose
-- PowerShell or Command Prompt (for Windows automation scripts)
-- Node.js and npm (for `client/` when using `ng serve` or `ng build`)
+- **.NET 9 SDK** (align with solution targets).
+- **Docker Desktop** or Docker Engine with Compose v2.
+- **Node.js** and **npm** for the client.
+- On Windows: **cmd** or **PowerShell** for `scripts/*.bat`.
 
-### Quick Start
+### Quick start (Windows)
 
-1. **Clone the repository**
+1. Clone and enter the repository.
+2. `scripts\compose-all.bat` — brings up MongoDB, Kafka, gateway (and any other `docker-compose.*.yml` in `docker/` processed by that script).
+3. `scripts\run-all.bat` — starts DeviceManager (wait), ACM, Simulation, TelemetryDevice, LTS, Mission Service, TelemetryRecords, MongoConsumer, then **`ng serve`** in `client/`.
+4. For **MapServer** or non-Windows flows, follow **`scripts/README.md`**.
 
-   ```bash
-   git clone <repository-url>
-   cd SMART
-   ```
+### Run individual services
 
-2. **Start the infrastructure services**
+Use the `cd … && dotnet run` examples from the previous section; always match **folder casing** on disk (Windows paths in `run-all.bat` use short names like `Simulation\simulation`).
 
-   From the repository root on Windows:
-
-   ```bat
-   scripts\compose-all.bat
-   ```
-
-   Or start individual stacks via the wrappers in `scripts/`:
-
-   ```bat
-   scripts\compose-messeging.bat
-   scripts\compose-gateway.bat
-   ```
-
-   The Compose files live under `docker/`; the batch files change into that directory and run `docker compose`.
-
-3. **Run the applications**
-
-   ```bat
-   scripts\run-all.bat
-   ```
-
-   For Docker plus applications in one flow, see `scripts\run-and-compose-all.bat`. For full-stack startup order, ports, and troubleshooting, see **`scripts/README.md`**.
-
-### Individual Service Management
-
-#### Simulation Service
-
-```bash
-cd Simulation/Simulation
-dotnet run
-```
-
-#### TelemetryDevice Service
-
-```bash
-cd TelemetryDevice/TelemetryDevice
-dotnet run
-```
-
-#### DeviceManager
-
-```bash
-cd DeviceManager/DeviceManager
-dotnet run
-```
-
-#### ACM
-
-```bash
-cd ACM/ACM
-dotnet run
-```
-
-#### Mission Service
-
-```bash
-cd "Mission Service/Mission Service"
-dotnet run
-```
-
-#### LTS
-
-```bash
-cd LTS/LTS
-dotnet run
-```
-
-#### TelemetryRecords
-
-```bash
-cd TelemetryRecords/TelemetryRecords
-dotnet run
-```
-
-#### MongoConsumer
-
-```bash
-cd MongoConsumer/MongoConsumer
-dotnet run
-```
-
-#### MapServer
-
-```bash
-cd MapServer/MapServer
-dotnet run
-```
-
-#### Angular client
-
-```bash
-cd client
-npm install
-ng serve
-```
+---
 
 ## Configuration
 
-### ICD Settings
+### ICD
 
-ICD-related JSON used by configuration is under **Core**:
+- Files under **`Core/Core/Files/ICD/`** (for example `NorthICD_telemetry.json`, `SouthICD_telemetry.json`).
+- **`Simulation/Simulation/appsettings.json`** — `ICD` section points at the effective ICD directory (verify relative paths from the running working directory).
 
-- `Core/Core/Files/ICD/NorthICD_telemetry.json`
-- `Core/Core/Files/ICD/SouthICD_telemetry.json`
+### Per-service settings
 
-`Simulation/Simulation/appsettings.json` references ICD paths via configuration (verify `ICD` section for the active path on your machine).
+Each service uses **`appsettings.json`** / **`appsettings.Development.json`** for Mongo connection strings, Kafka brokers, HTTP base URLs for peer services, and Kestrel URLs. Treat these as **environment-specific**; do not commit secrets.
 
-### Communication Channels
+### Communication and UAV modeling
 
-Multi-channel communication is supported through the Communication Controller with configurable port switching and channel management.
+- **CommunicationController** (Simulation) — programmatic **port switching** for multi-channel radio modeling.
+- **UAV properties** — sensors, weapons, flight envelopes, and mission parameters are represented in Simulation models and configuration; see `Simulation/README.md` for the UAV matrix.
 
-### UAV Properties
+---
 
-Configurable UAV properties including:
+## Simulation service internals (summary)
 
-- Sensor types and capabilities
-- Weapon system configurations
-- Flight characteristics
-- Mission context parameters
+- **Flight path service:** motion, orientation, speed, validators.
+- **UAV manager:** lifecycle and mission binding for armed and surveillance UAVs.
+- **Port manager:** allocation and switching for telemetry and comms endpoints.
+- **Quartz:** scheduled telemetry and simulation maintenance work.
 
-## API Endpoints
+---
 
-### Simulation (representative)
+## Docker (per stack)
 
-- Flight path simulation
-- Destination switching
-- Mission management
+- **Messaging:** `docker-compose.messaging.yml` — Kafka broker, listeners, single-node controller settings, persistent volume.
+- **Gateway:** `docker-compose.gateway.yml` — Nginx, tile volume mount from MapServer, config bind mount.
+- **MongoDB:** `docker-compose.mongodb.yml` — instance for local development (see `scripts/README.md` for connection string patterns used by scripts).
 
-### Communication Controller
-
-- Port switching operations
-- Channel management
-- Communication protocols
-
-### Telemetry Sniffers Controller
-
-- Packet capture operations
-- Telemetry data retrieval
-- Device monitoring
-
-### Other services (representative routes)
-
-- **Mission Service** — `api/Assignment`, `api/AssignmentResult`, `api/mission-status`, and related controllers under `Mission Service/Mission Service/Controllers/`.
-- **LTS** — `api/UAVTelemetryData`, `api/wanted-fields`.
-- **TelemetryRecords** — `api/TelemetryData`, `api/Assignment`.
-- **MapServer** — health and map APIs under `MapServer/MapServer/Controllers/` (see gateway routing in `docker/nginx/nginx.conf`).
-
-Use each service’s **Swagger** URL when running locally (typically under `/swagger` where enabled).
-
-## Services Architecture
-
-### Flight Path Service
-
-- **Motion Calculator**: Real-time position and velocity calculations
-- **Orientation Calculator**: Heading and attitude management
-- **Speed Controller**: Velocity profile management
-- **Validators**: Input validation and constraint checking
-
-### UAV Manager
-
-Manages different UAV types:
-
-- Armed UAVs with weapon systems
-- Surveillance UAVs with sensor packages
-- Mission context and operational parameters
-
-### Port Manager
-
-Handles communication port allocation and management for multi-channel operations.
-
-### Quartz Scheduler
-
-Background job scheduling for:
-
-- Periodic telemetry collection
-- Simulation state updates
-- System maintenance tasks
-
-## Docker Infrastructure
-
-### Messaging stack (Kafka)
-
-Defined in `docker/docker-compose.messaging.yml` (Kafka 7.7.0-style configuration; see file for full environment and volumes).
-
-### Gateway stack (Nginx)
-
-Defined in `docker/docker-compose.gateway.yml`. Host port **80** is mapped to port **8080** in the container; map tiles are mounted from `MapServer`. See that file and `docker/nginx/nginx.conf` for routing details.
-
-### MongoDB
-
-Defined in `docker/docker-compose.mongodb.yml` for local document storage used by multiple services.
+---
 
 ## Development
 
-### Building the project
+### Build
 
 ```bash
 dotnet build Simulation/Simulation.sln
 ```
 
-Build a specific `.csproj` when you change one service only (examples in repository root `CLAUDE.md`).
+For any other service, build that project’s **`.csproj`** directly (examples in repository root **`CLAUDE.md`**).
 
-### Running tests
+### Tests
 
 ```bash
 dotnet test Simulation/
 ```
 
-Adjust the path for other test projects as needed.
+Add paths for Mission Service, TelemetryDevice, or other test projects as they exist in your checkout.
 
-### Code structure
+### Layering (typical C# services)
 
-Simulation-oriented services commonly use:
+Controllers stay thin; **services** own workflows; **repositories** own MongoDB or external I/O; **DTO/Ro/entity** boundaries are explicit where the project follows the repository `CLAUDE.md` conventions.
 
-- **Controllers**: API endpoints and request handling
-- **Services**: Business logic and domain operations
-- **Models**: Data entities and DTOs
-- **Common**: Shared utilities and constants
-- **Configuration**: Service configuration and settings
+### Client
 
-Other folders may differ; follow the layout of the project you edit.
+```bash
+cd client
+npm ci   # or npm install
+ng build
+ng test
+```
+
+---
 
 ## Monitoring and telemetry
 
-The system includes telemetry collection through packet sniffing, performance metrics, communication channel monitoring, and UAV operational status tracking (see TelemetryDevice, LTS, TelemetryRecords, and MongoConsumer).
+Operational visibility combines **Simulation** and **TelemetryDevice** logs, **Kafka** consumer lag (where instrumented), **MongoDB** collections for missions and telemetry, **LTS** snapshot endpoints, and **TelemetryRecords** historical queries. Use Docker logs and per-service consoles started from `run-all.bat` windows.
+
+---
 
 ## Contributing
 
-Follow the established coding standards and ensure tests pass before submitting pull requests. Cross-service C# conventions are summarized in `CLAUDE.md` at the repository root.
+Follow team review practices, keep changes scoped, and respect **`CLAUDE.md`** for cross-cutting C# rules. Run **build** and **tests** for every project you touch before opening a pull request.
+
+---
 
 ## License
 
 [License information to be added]
 
+---
+
 ## Support
 
-For technical support and questions, refer to project documentation under each component, `scripts/README.md`, and `client/README.md` where applicable.
+Use **`scripts/README.md`** for startup and troubleshooting, **`client/README.md`** for the SPA, and per-service **`README.md`** files under `Simulation/`, `TelemetryDevice/`, and other folders when present.
